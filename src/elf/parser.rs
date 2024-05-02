@@ -26,6 +26,7 @@ use crate::IntoError as _;
 use crate::Result;
 use crate::SymType;
 
+use super::types::sym_matches;
 use super::types::Elf64_Chdr;
 use super::types::Elf64_Ehdr;
 use super::types::Elf64_Phdr;
@@ -73,8 +74,8 @@ fn find_sym<'mmap>(
                 // In ELF, a symbol size of 0 indicates "no size or an unknown
                 // size" (see elf(5)). We take our changes and report these on a
                 // best-effort basis.
-                if sym.matches(type_)
-                    && sym.st_shndx != SHN_UNDEF
+                if sym_matches(sym, type_)
+                    && sym.st_shndx != SHN_UNDEF as u16
                     && (sym.st_size == 0 || addr < sym.st_value + sym.st_size)
                 {
                     let sym = ResolvedSym {
@@ -374,7 +375,7 @@ impl<'mmap> Cache<'mmap> {
         // SHN_XINDEX (0xffff) and  the real index of the section name
         // string table section is held in the sh_link member of the
         // initial entry in section header table."
-        let shstrndx = if ehdr.e_shstrndx == SHN_XINDEX {
+        let shstrndx = if ehdr.e_shstrndx == SHN_XINDEX as u16 {
             let shdr = self.read_first_shdr(ehdr)?;
             shdr.sh_link
         } else {
@@ -463,7 +464,7 @@ impl<'mmap> Cache<'mmap> {
             .ok_or_invalid_data(|| "failed to read symbol table contents")?
             .iter()
             // Filter out any symbols that we do not support.
-            .filter(|sym| sym.matches(SymType::Undefined))
+            .filter(|sym| sym_matches(sym, SymType::Undefined))
             .collect::<Vec<&Elf64_Sym>>();
         // Order symbols by address and those with equal address descending by
         // size.
@@ -619,7 +620,7 @@ impl ElfParser {
     pub fn section_data(&self, idx: usize) -> Result<&[u8]> {
         let (shdr, mut data) = self.cache.section_data_raw(idx)?;
 
-        if shdr.sh_flags & SHF_COMPRESSED != 0 {
+        if shdr.sh_flags & SHF_COMPRESSED as u64 != 0 {
             let data = self.decompressed.get_or_try_insert(idx, || {
                 // Compression header is contained in the actual section
                 // data.
@@ -702,7 +703,7 @@ impl ElfParser {
     /// It is the caller's responsibility to ensure that the symbol's section
     /// index is not `SHN_UNDEF`.
     fn file_offset(&self, shdrs: &[Elf64_Shdr], sym: &Elf64_Sym) -> Result<u64> {
-        debug_assert_ne!(sym.st_shndx, SHN_UNDEF);
+        debug_assert_ne!(sym.st_shndx, SHN_UNDEF as u16);
 
         let section = shdrs
             .get(usize::from(sym.st_shndx))
@@ -734,7 +735,7 @@ impl ElfParser {
                     let sym_ref = &syms.get(*sym_i).ok_or_invalid_input(|| {
                         format!("symbol table index ({sym_i}) out of bounds")
                     })?;
-                    if sym_ref.st_shndx != SHN_UNDEF {
+                    if sym_ref.st_shndx != SHN_UNDEF as u16 {
                         found.push(SymInfo {
                             name: Cow::Borrowed(name_visit),
                             addr: sym_ref.st_value as Addr,
@@ -792,7 +793,7 @@ impl ElfParser {
             let sym = &syms
                 .get(*idx)
                 .ok_or_invalid_input(|| format!("symbol table index ({idx}) out of bounds"))?;
-            if sym.matches(opts.sym_type) && sym.st_shndx != SHN_UNDEF {
+            if sym_matches(sym, opts.sym_type) && sym.st_shndx != SHN_UNDEF as u16 {
                 let sym_info = SymInfo {
                     name: Cow::Borrowed(name),
                     addr: sym.st_value as Addr,
@@ -885,7 +886,9 @@ impl ElfParser {
         let symtab = self.cache.ensure_symtab().unwrap();
 
         let mut idx = symtab.len() / 2;
-        while !symtab[idx].matches(SymType::Function) || symtab[idx].st_shndx == SHN_UNDEF {
+        while !sym_matches(symtab[idx], SymType::Function)
+            || symtab[idx].st_shndx == SHN_UNDEF as u16
+        {
             idx += 1;
         }
         let sym = &symtab[idx];
@@ -921,6 +924,7 @@ mod tests {
     use std::mem::size_of;
     use std::slice;
 
+    use goblin::elf::Sym;
     use tempfile::NamedTempFile;
 
     use test_log::test;
@@ -1061,7 +1065,7 @@ mod tests {
                 e_phnum: 13,
                 e_shentsize: 64,
                 e_shnum: 0,
-                e_shstrndx: SHN_XINDEX,
+                e_shstrndx: SHN_XINDEX as u16,
             },
             shdrs: [Elf64_Shdr {
                 sh_name: 0,

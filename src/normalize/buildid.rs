@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::path::Path;
 
 use crate::elf;
-use crate::elf::types::Elf64_Nhdr;
+use crate::elf::types::Elf_Nhdr;
 use crate::elf::ElfParser;
 use crate::file_cache::FileCache;
 use crate::log::warn;
@@ -27,9 +27,9 @@ fn read_build_id_from_notes(parser: &ElfParser) -> Result<Option<BuildId<'_>>> {
             //         be found.
             let mut bytes = parser.section_data(idx).unwrap();
             let header = bytes
-                .read_pod_ref::<Elf64_Nhdr>()
+                .read_pod_ref::<Elf_Nhdr>()
                 .ok_or_invalid_data(|| "failed to read build ID section header")?;
-            if header.n_type == elf::types::NT_GNU_BUILD_ID {
+            if header.n_type == elf::types::NT_GNU_BUILD_ID as u32 {
                 // Type check is assumed to suffice, but we still need
                 // to skip the name bytes.
                 let _name = bytes
@@ -67,7 +67,7 @@ fn read_build_id_from_section_name(parser: &ElfParser) -> Result<Option<BuildId<
         //         found.
         let mut bytes = parser.section_data(idx).unwrap();
         let header = bytes
-            .read_pod_ref::<Elf64_Nhdr>()
+            .read_pod_ref::<Elf_Nhdr>()
             .ok_or_invalid_data(|| "failed to read build ID section header")?;
         let name = bytes
             .read_slice(header.n_namesz as _)
