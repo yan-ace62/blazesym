@@ -8,6 +8,8 @@ use std::ops::Deref as _;
 use std::path::Path;
 use std::path::PathBuf;
 
+use anyhow::Ok;
+
 use crate::insert_map::InsertMap;
 use crate::inspect::FindAddrOpts;
 use crate::inspect::SymInfo;
@@ -27,13 +29,23 @@ use crate::Result;
 use crate::SymType;
 
 use super::types::sym_matches;
+use super::types::Elf32_Chdr;
+use super::types::Elf32_Ehdr;
+use super::types::Elf32_Phdr;
+use super::types::Elf32_Shdr;
+use super::types::Elf32_Sym;
 use super::types::Elf64_Chdr;
 use super::types::Elf64_Ehdr;
 use super::types::Elf64_Phdr;
 use super::types::Elf64_Shdr;
 use super::types::Elf64_Sym;
+
+use super::types::EI_CLASS;
+use super::types::ELFCLASS32;
+use super::types::ELFCLASS64;
 use super::types::ELFCOMPRESS_ZLIB;
 use super::types::ELFCOMPRESS_ZSTD;
+use super::types::ELFMAG;
 use super::types::PN_XNUM;
 use super::types::PT_LOAD;
 use super::types::SHF_COMPRESSED;
@@ -138,8 +150,10 @@ fn decompress_zstd(_data: &[u8]) -> Result<Vec<u8>> {
 
 #[derive(Clone, Copy, Debug)]
 struct EhdrExt<'mmap> {
+    is_64: bool,
     /// The ELF header.
-    ehdr: &'mmap Elf64_Ehdr,
+    ehdr64: Option<&'mmap Elf64_Ehdr>,
+    ehdr32: Option<&'mmap Elf32_Ehdr>,
     /// Override of `ehdr.e_shnum`, handling of which is special-cased by
     /// the ELF standard.
     shnum: usize,
@@ -148,11 +162,51 @@ struct EhdrExt<'mmap> {
     phnum: usize,
 }
 
+impl<'mmap> EhdrExt<'mmap> {
+    fn is_64(&self) -> bool {
+        if self.is_64 {
+            true
+        } else {
+            false
+        }
+    }
+
+    fn elf64_ehdr(&self) -> &'mmap Elf64_Ehdr {
+        self.ehdr64.unwrap()
+    }
+
+    fn elf32_ehdr(&self) -> &'mmap Elf32_Ehdr {
+        self.ehdr32.unwrap()
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Shdr<'mmap> {
+    shdrs64: Option<&'mmap [Elf64_Shdr]>,
+    shdrs32: Option<&'mmap [Elf32_Shdr]>,
+}
+
+impl<'mmap> Shdr<'mmap> {
+    fn is_64(&self) -> bool {
+        if self.shdrs64.is_some() {
+            true
+        } else {
+            false
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Phdr<'mmap> {
+    phdrs64: Option<&'mmap [Elf64_Phdr]>,
+    phdrs32: Option<&'mmap [Elf32_Phdr]>,
+}
 
 #[derive(Debug)]
 struct SymbolTableCache<'mmap> {
     /// The cached symbols (in address order).
-    syms: Box<[&'mmap Elf64_Sym]>,
+    syms64: Box<[&'mmap Elf64_Sym]>,
+    syms32: Box<[&'mmap Elf32_Sym]>,
     /// The string table.
     strs: &'mmap [u8],
     /// The cached name to symbol index table (in dictionary order).
@@ -219,20 +273,24 @@ struct Cache<'mmap> {
     /// The cached ELF header.
     ehdr: OnceCell<EhdrExt<'mmap>>,
     /// The cached ELF section headers.
-    shdrs: OnceCell<&'mmap [Elf64_Shdr]>,
+    shdrs: OnceCell<Shdr<'mmap>>,
+    // /// The cached ELF section headers.
+    // shdrs: OnceCell<&'mmap [Elf64_Shdr]>,
     shstrtab: OnceCell<&'mmap [u8]>,
     /// The cached ELF program headers.
-    phdrs: OnceCell<&'mmap [Elf64_Phdr]>,
+    phdrs: OnceCell<Phdr<'mmap>>,
+    // phdrs: OnceCell<&'mmap [Elf64_Phdr]>,
     /// The cached symbol table.
     symtab: OnceCell<SymbolTableCache<'mmap>>,
     /// The cached dynamic symbol table.
     dynsym: OnceCell<SymbolTableCache<'mmap>>,
+    is_64: bool,
 }
 
 impl<'mmap> Cache<'mmap> {
     /// Create a new `Cache` using the provided raw ELF object data.
-    fn new(elf_data: &'mmap [u8]) -> Self {
-        Self {
+    fn new(elf_data: &'mmap [u8]) -> Result<Self> {
+        Ok(Self {
             elf_data,
             ehdr: OnceCell::new(),
             shdrs: OnceCell::new(),
@@ -240,13 +298,31 @@ impl<'mmap> Cache<'mmap> {
             phdrs: OnceCell::new(),
             symtab: OnceCell::new(),
             dynsym: OnceCell::new(),
-        }
+            is_64: true,
+        })
     }
 
     /// Retrieve the raw section data for the ELF section at index
     /// `idx`, along with it's section header.
-    fn section_data_raw(&self, idx: usize) -> Result<(&'mmap Elf64_Shdr, &'mmap [u8])> {
-        let shdrs = self.ensure_shdrs()?;
+    fn section_data_raw64(&self, idx: usize) -> Result<(&'mmap Elf64_Shdr, &'mmap [u8])> {
+        let shdrs = self.ensure_shdrs64()?;
+        let shdr = shdrs
+            .get(idx)
+            .ok_or_invalid_input(|| format!("ELF section index ({idx}) out of bounds"))?;
+
+        let data = self
+            .elf_data
+            .get(shdr.sh_offset as usize..)
+            .ok_or_invalid_data(|| "failed to read section data: invalid offset")?
+            .read_slice(shdr.sh_size as usize)
+            .ok_or_invalid_data(|| "failed to read section data: invalid size")?;
+        Ok((shdr, data))
+    }
+
+    /// Retrieve the raw section data for the ELF section at index
+    /// `idx`, along with it's section header.
+    fn section_data_raw32(&self, idx: usize) -> Result<(&'mmap Elf32_Shdr, &'mmap [u8])> {
+        let shdrs = self.ensure_shdrs32()?;
         let shdr = shdrs
             .get(idx)
             .ok_or_invalid_input(|| format!("ELF section index ({idx}) out of bounds"))?;
@@ -263,7 +339,11 @@ impl<'mmap> Cache<'mmap> {
     /// Retrieve the raw section data for the ELF section at index
     /// `idx`.
     fn section_data(&self, idx: usize) -> Result<&'mmap [u8]> {
-        self.section_data_raw(idx).map(|(_section, data)| data)
+        if self.is_64 == true {
+            self.section_data_raw64(idx).map(|(_section, data)| data)
+        } else {
+            self.section_data_raw32(idx).map(|(_section, data)| data)
+        }
     }
 
     /// Read the very first section header.
@@ -272,7 +352,7 @@ impl<'mmap> Cache<'mmap> {
     /// of certain member variables to reference data from this header,
     /// which otherwise is zeroed out.
     #[inline]
-    fn read_first_shdr(&self, ehdr: &Elf64_Ehdr) -> Result<&'mmap Elf64_Shdr> {
+    fn read_first_shdr64(&self, ehdr: &Elf64_Ehdr) -> Result<&'mmap Elf64_Shdr> {
         let shdr = self
             .elf_data
             .get(ehdr.e_shoff as usize..)
@@ -282,76 +362,269 @@ impl<'mmap> Cache<'mmap> {
         Ok(shdr)
     }
 
+    /// Read the very first section header.
+    ///
+    /// ELF contains a couple of clauses that special case data ranges
+    /// of certain member variables to reference data from this header,
+    /// which otherwise is zeroed out.
+    #[inline]
+    fn read_first_shdr32(&self, ehdr: &Elf32_Ehdr) -> Result<&'mmap Elf32_Shdr> {
+        let shdr = self
+            .elf_data
+            .get(ehdr.e_shoff as usize..)
+            .ok_or_invalid_data(|| "Elf64_Ehdr::e_shoff is invalid")?
+            .read_pod_ref::<Elf32_Shdr>()
+            .ok_or_invalid_data(|| "failed to read Elf64_Shdr")?;
+        Ok(shdr)
+    }
+
     fn parse_ehdr(&self) -> Result<EhdrExt<'mmap>> {
         let mut elf_data = self.elf_data;
-        let ehdr = elf_data
-            .read_pod_ref::<Elf64_Ehdr>()
-            .ok_or_invalid_data(|| "failed to read Elf64_Ehdr")?;
-        if !(ehdr.e_ident[0] == 0x7f
-            && ehdr.e_ident[1] == b'E'
-            && ehdr.e_ident[2] == b'L'
-            && ehdr.e_ident[3] == b'F')
+        let ehdr_ext: EhdrExt;
+
+        if !(elf_data[0] == 0x7f
+            && elf_data[1] == b'E'
+            && elf_data[2] == b'L'
+            && elf_data[3] == b'F')
         {
             return Err(Error::with_invalid_data(format!(
                 "encountered unexpected e_ident: {:x?}",
-                &ehdr.e_ident[0..4]
+                &elf_data[0..4]
             )))
         }
+
+        if elf_data[EI_CLASS] == ELFCLASS32 {
+            let ehdr = elf_data
+                .read_pod_ref::<Elf32_Ehdr>()
+                .ok_or_invalid_data(|| "failed to read Elf64_Ehdr")?;
+
+            // "If the number of entries in the section header table is larger than
+            // or equal to SHN_LORESERVE, e_shnum holds the value zero and the real
+            // number of entries in the section header table is held in the sh_size
+            // member of the initial entry in section header table."
+            let shnum = if ehdr.e_shnum == 0 {
+                let shdr = self.read_first_shdr32(ehdr)?;
+                usize::try_from(shdr.sh_size).ok().ok_or_invalid_data(|| {
+                    format!(
+                        "ELF file contains unsupported number of sections ({})",
+                        shdr.sh_size
+                    )
+                })?
+            } else {
+                ehdr.e_shnum.into()
+            };
+
+            let phnum = if ehdr.e_phnum == PN_XNUM {
+                let shdr = self.read_first_shdr32(ehdr)?;
+                usize::try_from(shdr.sh_info).ok().ok_or_invalid_data(|| {
+                    format!(
+                        "ELF file contains unsupported number of program headers ({})",
+                        shdr.sh_info
+                    )
+                })?
+            } else {
+                ehdr.e_phnum.into()
+            };
+
+            ehdr_ext = EhdrExt {
+                is_64: false,
+                ehdr32: Some(ehdr),
+                ehdr64: None,
+                shnum,
+                phnum,
+            };
+        } else if elf_data[EI_CLASS] == ELFCLASS64 {
+            let ehdr = elf_data
+                .read_pod_ref::<Elf64_Ehdr>()
+                .ok_or_invalid_data(|| "failed to read Elf64_Ehdr")?;
+
+            // "If the number of entries in the section header table is larger than
+            // or equal to SHN_LORESERVE, e_shnum holds the value zero and the real
+            // number of entries in the section header table is held in the sh_size
+            // member of the initial entry in section header table."
+            let shnum = if ehdr.e_shnum == 0 {
+                let shdr = self.read_first_shdr64(ehdr)?;
+                usize::try_from(shdr.sh_size).ok().ok_or_invalid_data(|| {
+                    format!(
+                        "ELF file contains unsupported number of sections ({})",
+                        shdr.sh_size
+                    )
+                })?
+            } else {
+                ehdr.e_shnum.into()
+            };
+
+            let phnum = if ehdr.e_phnum == PN_XNUM {
+                let shdr = self.read_first_shdr64(ehdr)?;
+                usize::try_from(shdr.sh_info).ok().ok_or_invalid_data(|| {
+                    format!(
+                        "ELF file contains unsupported number of program headers ({})",
+                        shdr.sh_info
+                    )
+                })?
+            } else {
+                ehdr.e_phnum.into()
+            };
+
+            ehdr_ext = EhdrExt {
+                is_64: true,
+                ehdr32: None,
+                ehdr64: Some(ehdr),
+                shnum,
+                phnum,
+            };
+        } else {
+            return Err(Error::with_invalid_data(format!(
+                "encountered unexpected e_ident: {:x?}",
+                &elf_data[0..4]
+            )))
+        }
+
+        Ok(ehdr_ext)
+
+        // let ehdr = elf_data
+        //     .read_pod_ref::<Elf64_Ehdr>()
+        //     .ok_or_invalid_data(|| "failed to read Elf64_Ehdr")?;
+        // if !(ehdr.e_ident[0] == 0x7f
+        //     && ehdr.e_ident[1] == b'E'
+        //     && ehdr.e_ident[2] == b'L'
+        //     && ehdr.e_ident[3] == b'F')
+        // {
+        //     return Err(Error::with_invalid_data(format!(
+        //         "encountered unexpected e_ident: {:x?}",
+        //         &ehdr.e_ident[0..4]
+        //     )))
+        // }
 
         // "If the number of entries in the section header table is larger than
         // or equal to SHN_LORESERVE, e_shnum holds the value zero and the real
         // number of entries in the section header table is held in the sh_size
         // member of the initial entry in section header table."
-        let shnum = if ehdr.e_shnum == 0 {
-            let shdr = self.read_first_shdr(ehdr)?;
-            usize::try_from(shdr.sh_size).ok().ok_or_invalid_data(|| {
-                format!(
-                    "ELF file contains unsupported number of sections ({})",
-                    shdr.sh_size
-                )
-            })?
-        } else {
-            ehdr.e_shnum.into()
-        };
+        // let shnum = if ehdr.e_shnum == 0 {
+        //     let shdr = self.read_first_shdr(ehdr)?;
+        //     usize::try_from(shdr.sh_size).ok().ok_or_invalid_data(|| {
+        //         format!(
+        //             "ELF file contains unsupported number of sections ({})",
+        //             shdr.sh_size
+        //         )
+        //     })?
+        // } else {
+        //     ehdr.e_shnum.into()
+        // };
 
-        // "If the number of entries in the program header table is
-        // larger than or equal to PN_XNUM (0xffff), this member holds
-        // PN_XNUM (0xffff) and the real number of entries in the
-        // program header table is held in the sh_info member of the
-        // initial entry in section header table."
-        let phnum = if ehdr.e_phnum == PN_XNUM {
-            let shdr = self.read_first_shdr(ehdr)?;
-            usize::try_from(shdr.sh_info).ok().ok_or_invalid_data(|| {
-                format!(
-                    "ELF file contains unsupported number of program headers ({})",
-                    shdr.sh_info
-                )
-            })?
-        } else {
-            ehdr.e_phnum.into()
-        };
+        // // "If the number of entries in the program header table is
+        // // larger than or equal to PN_XNUM (0xffff), this member holds
+        // // PN_XNUM (0xffff) and the real number of entries in the
+        // // program header table is held in the sh_info member of the
+        // // initial entry in section header table."
+        // let phnum = if ehdr.e_phnum == PN_XNUM {
+        //     let shdr = self.read_first_shdr(ehdr)?;
+        //     usize::try_from(shdr.sh_info).ok().ok_or_invalid_data(|| {
+        //         format!(
+        //             "ELF file contains unsupported number of program headers
+        // ({})",             shdr.sh_info
+        //         )
+        //     })?
+        // } else {
+        //     ehdr.e_phnum.into()
+        // };
 
-        let ehdr = EhdrExt { ehdr, shnum, phnum };
-        Ok(ehdr)
+        // let ehdr = EhdrExt { ehdr, shnum, phnum };
+        // Ok(ehdr)
     }
 
     fn ensure_ehdr(&self) -> Result<&EhdrExt<'mmap>> {
         self.ehdr.get_or_try_init(|| self.parse_ehdr())
     }
 
-    fn parse_shdrs(&self) -> Result<&'mmap [Elf64_Shdr]> {
+    fn parse_shdrs64(&self) -> Result<&'mmap [Elf64_Shdr]> {
         let ehdr = self.ensure_ehdr()?;
+
         let shdrs = self
             .elf_data
-            .get(ehdr.ehdr.e_shoff as usize..)
+            .get(ehdr.ehdr64.unwrap().e_shoff as usize..)
             .ok_or_invalid_data(|| "Elf64_Ehdr::e_shoff is invalid")?
             .read_pod_slice_ref::<Elf64_Shdr>(ehdr.shnum)
             .ok_or_invalid_data(|| "failed to read Elf64_Shdr")?;
         Ok(shdrs)
     }
 
+
+    // fn ensure_shdrs64(&self) -> Result<&'mmap [Elf64_Shdr]> {
+    //     self.shdrs.get_or_try_init(|| self.parse_shdrs64())
+    // }
+
     fn ensure_shdrs(&self) -> Result<&'mmap [Elf64_Shdr]> {
-        self.shdrs.get_or_try_init(|| self.parse_shdrs()).copied()
+        self.shdrs.get_or_try_init(|| self.parse_shdrs64()).copied()
+    }
+
+    fn parse_shdr32(&self) -> Result<&'mmap [Elf32_Shdr]> {
+        let ehdr = self.ensure_ehdr()?;
+
+        let shdrs = self
+            .elf_data
+            .get(ehdr.elf32_ehdr().e_shoff as usize..)
+            .ok_or_invalid_data(|| "Elf64_Ehdr::e_shoff is invalid")?
+            .read_pod_slice_ref::<Elf64_Shdr>(ehdr.shnum)
+            .ok_or_invalid_data(|| "failed to read Elf64_Shdr")?;
+        Ok(shdrs)
+    }
+
+    fn parse_shdr(&self) -> Result<Shdr<'mmap>> {
+        let ehdr = self.ensure_ehdr()?;
+        let shdr: Shdr;
+
+        if ehdr.is_64() {
+            let shdrs = self
+                .elf_data
+                .get(ehdr.elf64_ehdr().e_shoff as usize..)
+                .ok_or_invalid_data(|| "Elf64_Ehdr::e_shoff is invalid")?
+                .read_pod_slice_ref::<Elf64_Shdr>(ehdr.shnum)
+                .ok_or_invalid_data(|| "failed to read Elf64_Shdr")?;
+
+            shdr = Shdr {
+                shdrs64: Some(shdrs),
+                shdrs32: None,
+            }
+        } else {
+            let shdrs = self
+                .elf_data
+                .get(ehdr.elf32_ehdr().e_shoff as usize..)
+                .ok_or_invalid_data(|| "Elf64_Ehdr::e_shoff is invalid")?
+                .read_pod_slice_ref::<Elf32_Shdr>(ehdr.shnum)
+                .ok_or_invalid_data(|| "failed to read Elf64_Shdr")?;
+
+            shdr = Shdr {
+                shdrs64: None,
+                shdrs32: Some(shdrs),
+            }
+        }
+
+        Ok(shdr)
+
+        // let shdrs = self
+        //     .elf_data
+        //     .get(ehdr.ehdr.e_shoff as usize..)
+        //     .ok_or_invalid_data(|| "Elf64_Ehdr::e_shoff is invalid")?
+        //     .read_pod_slice_ref::<Elf64_Shdr>(ehdr.shnum)
+        //     .ok_or_invalid_data(|| "failed to read Elf64_Shdr")?;
+        // Ok(shdrs)
+    }
+
+    fn ensure_shdrs32(&self) -> Result<&'mmap [Elf32_Shdr]> {
+        let shdr = self.shdrs.get_or_try_init(|| self.parse_shdr()).unwrap();
+
+        Ok(shdr.shdrs32.unwrap())
+    }
+
+    fn ensure_shdrs64(&self) -> Result<&'mmap [Elf64_Shdr]> {
+        let shdr = self.shdrs.get_or_try_init(|| self.parse_shdr()).unwrap();
+
+        Ok(shdr.shdrs64.unwrap())
+    }
+
+    fn ensure_shdrs(&self) -> Result<&'mmap [Elf32_Shdr]> {
+        self.shdrs.get_or_try_init(|| self.parse_shdrs())
     }
 
     fn parse_phdrs(&self) -> Result<&'mmap [Elf64_Phdr]> {
@@ -365,11 +638,85 @@ impl<'mmap> Cache<'mmap> {
         Ok(phdrs)
     }
 
+    fn parse_phdr(&self) -> Result<Phdr<'mmap>> {
+        let phdr: Phdr;
+        let ehdr = self.ensure_ehdr()?;
+
+        if ehdr.is_64() {
+            let phdrs = self
+                .elf_data
+                .get(ehdr.elf64_ehdr().e_phoff as usize..)
+                .ok_or_invalid_data(|| "Elf64_Ehdr::e_phoff is invalid")?
+                .read_pod_slice_ref::<Elf64_Phdr>(ehdr.phnum)
+                .ok_or_invalid_data(|| "failed to read Elf64_Phdr")?;
+
+            phdr = Phdr {
+                phdrs64: Some(phdrs),
+                phdrs32: None,
+            };
+
+        } else {
+            let phdrs = self
+                .elf_data
+                .get(ehdr.elf32_ehdr().e_phoff as usize..)
+                .ok_or_invalid_data(|| "Elf64_Ehdr::e_phoff is invalid")?
+                .read_pod_slice_ref::<Elf32_Phdr>(ehdr.phnum)
+                .ok_or_invalid_data(|| "failed to read Elf64_Phdr")?;
+
+                phdr = Phdr {
+                    phdrs64: None,
+                    phdrs32: Some(phdrs),
+                };
+
+        }
+
+        Ok(phdr)
+
+        // let phdrs = self
+        //     .elf_data
+        //     .get(ehdr.ehdr.e_phoff as usize..)
+        //     .ok_or_invalid_data(|| "Elf64_Ehdr::e_phoff is invalid")?
+        //     .read_pod_slice_ref::<Elf64_Phdr>(ehdr.phnum)
+        //     .ok_or_invalid_data(|| "failed to read Elf64_Phdr")?;
+        // Ok(phdrs)
+    }
+
     fn ensure_phdrs(&self) -> Result<&'mmap [Elf64_Phdr]> {
-        self.phdrs.get_or_try_init(|| self.parse_phdrs()).copied()
+        self.phdrs.get_or_try_init(|| self.parse_phdr()).copied()
+    }
+
+    fn ensure_phdrs64(&self) -> Result<&'mmap [Elf64_Phdr]> {
+        let phdr = self.phdrs.get_or_try_init(|| self.parse_phdr()).unwrap();
+
+        Ok(phdr.phdrs64.unwrap())
+    }
+
+    fn ensure_phdrs32(&self) -> Result<&'mmap [Elf32_Phdr]> {
+        let phdr = self.phdrs.get_or_try_init(|| self.parse_phdr()).unwrap();
+
+        Ok(phdr.phdrs32.unwrap())
     }
 
     fn shstrndx(&self, ehdr: &Elf64_Ehdr) -> Result<usize> {
+        // "If the index of section name string table section is larger
+        // than or equal to SHN_LORESERVE (0xff00), this member holds
+        // SHN_XINDEX (0xffff) and  the real index of the section name
+        // string table section is held in the sh_link member of the
+        // initial entry in section header table."
+        let shstrndx = if ehdr.e_shstrndx == SHN_XINDEX as u16 {
+            let shdr = self.read_first_shdr(ehdr)?;
+            shdr.sh_link
+        } else {
+            u32::from(ehdr.e_shstrndx)
+        };
+
+        let shstrndx = usize::try_from(shstrndx).ok().ok_or_invalid_data(|| {
+            format!("ELF file contains unsupported section name string table index ({shstrndx})")
+        })?;
+        Ok(shstrndx)
+    }
+
+    fn shstrndx(&self) -> Result<usize> {
         // "If the index of section name string table section is larger
         // than or equal to SHN_LORESERVE (0xff00), this member holds
         // SHN_XINDEX (0xffff) and  the real index of the section name
@@ -466,6 +813,74 @@ impl<'mmap> Cache<'mmap> {
             // Filter out any symbols that we do not support.
             .filter(|sym| sym_matches(sym, SymType::Undefined))
             .collect::<Vec<&Elf64_Sym>>();
+        // Order symbols by address and those with equal address descending by
+        // size.
+        let () = syms.sort_by(|sym1, sym2| {
+            sym1.st_value
+                .cmp(&sym2.st_value)
+                .then_with(|| sym1.st_size.cmp(&sym2.st_size).reverse())
+        });
+
+        Ok(syms)
+    }
+
+    fn parse_syms64(&self, section: &str) -> Result<Vec<&'mmap Elf64_Sym>> {
+        let idx = if let Some(idx) = self.find_section(section)? {
+            idx
+        } else {
+            // The symbol table does not exists. Fake an empty one.
+            return Ok(Vec::new())
+        };
+        let mut syms = self.section_data(idx)?;
+
+        if syms.len() % mem::size_of::<Elf64_Sym>() != 0 {
+            return Err(Error::with_invalid_data(
+                "size of symbol table section is invalid",
+            ))
+        }
+
+        let count = syms.len() / mem::size_of::<Elf64_Sym>();
+        let mut syms = syms
+            .read_pod_slice_ref::<Elf64_Sym>(count)
+            .ok_or_invalid_data(|| "failed to read symbol table contents")?
+            .iter()
+            // Filter out any symbols that we do not support.
+            .filter(|sym| sym_matches(sym, SymType::Undefined))
+            .collect::<Vec<&Elf64_Sym>>();
+        // Order symbols by address and those with equal address descending by
+        // size.
+        let () = syms.sort_by(|sym1, sym2| {
+            sym1.st_value
+                .cmp(&sym2.st_value)
+                .then_with(|| sym1.st_size.cmp(&sym2.st_size).reverse())
+        });
+
+        Ok(syms)
+    }
+
+    fn parse_syms32(&self, section: &str) -> Result<Vec<&'mmap Elf32_Sym>> {
+        let idx = if let Some(idx) = self.find_section(section)? {
+            idx
+        } else {
+            // The symbol table does not exists. Fake an empty one.
+            return Ok(Vec::new())
+        };
+        let mut syms = self.section_data(idx)?;
+
+        if syms.len() % mem::size_of::<Elf32_Sym>() != 0 {
+            return Err(Error::with_invalid_data(
+                "size of symbol table section is invalid",
+            ))
+        }
+
+        let count = syms.len() / mem::size_of::<Elf32_Sym>();
+        let mut syms = syms
+            .read_pod_slice_ref::<Elf32_Sym>(count)
+            .ok_or_invalid_data(|| "failed to read symbol table contents")?
+            .iter()
+            // Filter out any symbols that we do not support.
+            .filter(|sym| sym_matches(sym, SymType::Undefined))
+            .collect::<Vec<&Elf32_Sym>>();
         // Order symbols by address and those with equal address descending by
         // size.
         let () = syms.sort_by(|sym1, sym2| {

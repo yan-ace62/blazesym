@@ -8,6 +8,14 @@ pub(crate) use goblin::elf::program_header::program_header64::ProgramHeader as E
 pub(crate) use goblin::elf::section_header::section_header64::SectionHeader as Elf64_Shdr;
 pub(crate) use goblin::elf::sym::sym64::Sym as Elf64_Sym;
 
+pub(crate) use goblin::elf::compression_header::compression_header32::CompressionHeader as Elf32_Chdr;
+pub(crate) use goblin::elf::header::header32::Header as Elf32_Ehdr;
+pub(crate) use goblin::elf::program_header::program_header32::ProgramHeader as Elf32_Phdr;
+pub(crate) use goblin::elf::section_header::section_header32::SectionHeader as Elf32_Shdr;
+pub(crate) use goblin::elf::sym::sym32::Sym as Elf32_Sym;
+
+pub(crate) use goblin::elf::sym::Sym as Elf_Sym;
+
 pub(crate) use goblin::elf::compression_header::ELFCOMPRESS_ZLIB;
 pub(crate) use goblin::elf::note::NT_GNU_BUILD_ID;
 pub(crate) use goblin::elf::program_header::PT_LOAD;
@@ -16,6 +24,12 @@ pub(crate) use goblin::elf::section_header::SHN_LORESERVE;
 pub(crate) use goblin::elf::section_header::SHN_UNDEF;
 pub(crate) use goblin::elf::section_header::SHN_XINDEX;
 pub(crate) use goblin::elf::section_header::SHT_NOTE;
+
+pub(crate) use goblin::elf::header::EI_CLASS;
+pub(crate) use goblin::elf::header::ELFCLASS32;
+pub(crate) use goblin::elf::header::ELFCLASS64;
+pub(crate) use goblin::elf::header::ELFMAG;
+pub(crate) use goblin::elf::header::SELFMAG;
 
 use goblin::elf::sym::st_type;
 use goblin::elf::sym::STT_FUNC;
@@ -35,7 +49,20 @@ unsafe impl Pod for Elf64_Chdr {}
 // SAFETY: `Elf_Nhdr` is valid for any bit pattern.
 unsafe impl Pod for Elf_Nhdr {}
 
-impl TryFrom<&Elf64_Sym> for SymType {
+
+// SAFETY: `Elf64_Ehdr` is valid for any bit pattern.
+unsafe impl Pod for Elf32_Ehdr {}
+// SAFETY: `Elf64_Phdr` is valid for any bit pattern.
+unsafe impl Pod for Elf32_Phdr {}
+// SAFETY: `Elf64_Shdr` is valid for any bit pattern.
+unsafe impl Pod for Elf32_Shdr {}
+// SAFETY: `Elf64_Sym` is valid for any bit pattern.
+unsafe impl Pod for Elf32_Sym {}
+// SAFETY: `Elf64_Chdr` is valid for any bit pattern.
+unsafe impl Pod for Elf32_Chdr {}
+
+
+impl TryFrom<&Elf_Sym> for SymType {
     type Error = ();
 
     fn try_from(other: &Elf64_Sym) -> Result<Self, Self::Error> {
@@ -47,8 +74,8 @@ impl TryFrom<&Elf64_Sym> for SymType {
     }
 }
 
-pub(crate) fn sym_matches(symbol: &Elf64_Sym, sym_type: SymType) -> bool {
-    let elf_ty = st_type(symbol.st_info);
+pub(crate) fn sym_matches(symbol: &Elf_Sym, sym_type: SymType) -> bool {
+    let elf_ty = symbol.st_type();
     let is_func = elf_ty == STT_FUNC || elf_ty == STT_GNU_IFUNC;
     let is_var = elf_ty == STT_OBJECT;
 
@@ -63,4 +90,3 @@ pub(crate) const PN_XNUM: u16 = 0xffff;
 
 /// zstd algorithm.
 pub(crate) const ELFCOMPRESS_ZSTD: u32 = 2;
-

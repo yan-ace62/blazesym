@@ -377,7 +377,7 @@ fn prepare_test_files() {
     cc(
         &src,
         "libtest-so.so",
-        &["-shared", "-fPIC", "-Wl,--build-id=sha1"],
+        &["-shared", "-fPIC", "-m32", "-Wl,--build-id=sha1"],
     );
     cc(
         &src,
